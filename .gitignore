@@ -1,0 +1,13 @@
+MMD6020-Projet-MIMIC/
+# Allow ONLY these files
+!/Projet.ipynb
+!/models.py
+!/feature_selection.py
+!/nettoyage_donnees.py
+
+# Ignore EVERYTHING else
+*
+
+# Exceptions for Git metadata
+!.gitignore
+
