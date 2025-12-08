@@ -5,6 +5,7 @@ import seaborn as sns
 import os
 from functools import reduce
 import re
+from scipy.stats import ttest_ind, chi2_contingency 
 
 # ============================================
 #           Load relevant csvs
@@ -195,9 +196,9 @@ ITEMIDS = {
         225477      # Unplanned Extubation (non-patient)
     ],
 
-    # Non-invasive ventilation (not an extubation)
+    # Non-invasive ventilation 
     "noninvasive_events": [
-        225794       # NIV / BiPAP / CPAP is *ventilation ON*, NOT OFF
+        225794       # NIV / BiPAP / CPAP 
     ]
     },
 
@@ -1205,3 +1206,119 @@ def clean_df(df):
 
     # Return clean dataframe
     return df[keep_cols].copy()
+
+
+#==========================================================
+#               Generate table 1
+#===========================================================
+
+def generate_table1(df, outcome_col="readmit_72h", vars_keep=None):
+    """
+    Produce a Table 1 comparing selected variables between
+    non-readmitted vs readmitted ICU patients.
+
+    Only variables in vars_keep are included.
+    Means/SD are computed ONLY for: age, los_days, vent_days.
+    All other variables are treated as categorical n (%).
+    """
+
+    # Default variables
+    if vars_keep is None:
+        vars_keep = [
+            "age",
+            "gender",           # will be recoded to "female"
+            "los_days",
+            "vent_days",
+            "pressor_last48",
+            "crrt_last48",
+            "hospital_mortality",
+        ]
+
+    # Copy and ensure outcome is integer
+    df = df.copy()
+    df[outcome_col] = df[outcome_col].astype(int)
+
+    # Recode gender → female = 1
+    if "gender" in df.columns:
+        df["female"] = (df["gender"].str.upper().isin(["F", "FEMALE"])).astype(int)
+        vars_keep = ["age", "female"] + [v for v in vars_keep if v not in ["gender", "age"]]
+
+    # Define numeric variables that get mean ± SD
+    numeric_summary_vars = {"age", "los_days", "vent_days"}
+
+    grp0 = df[df[outcome_col] == 0]
+    grp1 = df[df[outcome_col] == 1]
+
+    table_rows = []
+
+    for col in vars_keep:
+        if col not in df.columns:
+            continue
+
+        if col in numeric_summary_vars:
+            # Continuous variable → mean ± SD
+            mean0, sd0 = grp0[col].mean(), grp0[col].std()
+            mean1, sd1 = grp1[col].mean(), grp1[col].std()
+
+            try:
+                _, pval = ttest_ind(
+                    grp0[col].dropna(),
+                    grp1[col].dropna(),
+                    equal_var=False
+                )
+            except:
+                pval = np.nan
+
+            row = {
+                "Variable": col,
+                f"Non-readmitted (n={len(grp0)})": f"{mean0:.2f} ± {sd0:.2f}",
+                f"Readmitted (n={len(grp1)})": f"{mean1:.2f} ± {sd1:.2f}",
+                "P-value": pval,
+            }
+
+        else:
+            # Categorical variable → n (%)
+            counts0 = grp0[col].value_counts(dropna=False)
+            counts1 = grp1[col].value_counts(dropna=False)
+
+            idx = sorted(set(counts0.index).union(counts1.index))
+
+            contingency = np.array([
+                [counts0.get(i, 0) for i in idx],
+                [counts1.get(i, 0) for i in idx],
+            ])
+
+            try:
+                _, pval, _, _ = chi2_contingency(contingency)
+            except:
+                pval = np.nan
+
+            perc0 = grp0[col].value_counts(normalize=True, dropna=False)
+            perc1 = grp1[col].value_counts(normalize=True, dropna=False)
+
+            formatted0 = "; ".join(
+                f"{cat}: {counts0.get(cat,0)} ({perc0.get(cat,0)*100:.1f}%)"
+                for cat in idx
+            )
+            formatted1 = "; ".join(
+                f"{cat}: {counts1.get(cat,0)} ({perc1.get(cat,0)*100:.1f}%)"
+                for cat in idx
+            )
+
+            row = {
+                "Variable": col,
+                f"Non-readmitted (n={len(grp0)})": formatted0,
+                f"Readmitted (n={len(grp1)})": formatted1,
+                "P-value": pval,
+            }
+
+        table_rows.append(row)
+
+    table1 = pd.DataFrame(table_rows)
+
+    # Format p-values
+    table1["P-value"] = table1["P-value"].apply(
+        lambda x: "<0.001" if pd.notnull(x) and x < 0.001 else f"{x:.3f}" if pd.notnull(x) else ""
+    )
+
+    return table1

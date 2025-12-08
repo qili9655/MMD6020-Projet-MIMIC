@@ -27,8 +27,10 @@ from sklearn.calibration import calibration_curve, CalibrationDisplay
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, RobustScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.utils import shuffle
 import joblib
 
 
@@ -469,38 +471,94 @@ def plot_variable_with_outliers(df, variable, figsize=(12,6), bins=20):
 
 def remove_nonphysiologic_values(df):
     """
-    Removes clearly impossible values for specific clinical variables.
-    Does NOT remove clinically plausible outliers.
+    Removes clearly impossible (non-physiologic) values for clinical variables.
+    Values outside allowed ranges are replaced with NaN (rows are NOT dropped).
 
-    Returns a cleaned dataframe and prints what was removed.
+    Parameters
+    ----------
+    df : pandas DataFrame
+
+    Returns
+    -------
+    df_clean : pandas DataFrame
+        Cleaned dataframe with out-of-range values replaced by NaN.
     """
 
     df_clean = df.copy()
 
+    # ----------------------------
+    # Physiologic ranges
+    # ----------------------------
     rules = {
-        "temp":              (25, 46),      # °C
-        "bilirubin_lab":     (0, 35),       # mg/dL
-        "pfratio":           (0, 600),      # mmHg
-        "delta_spo2":        (-50, 100),   # %
-        "delta_temp":        (-10, 10),     # °C change
+        # Vitals
+        "spo2":          (0, 100),          # %
+        "fio2":          (0, 1.0),          # fraction
+        "map":           (20, 200),         # mmHg
+        "temp":          (25, 46),          # °C
+        "gcs":           (3, 15),           # total score
+        "pao2":          (20, 600),         # mmHg
+        "pfratio":       (0, 600),          # mmHg
+        
+        # Labs
+        "lactate_lab":   (0, 30),           # mmol/L
+        "creatinine_lab":(0, 20),           # mg/dL
+        "bun_lab":       (0, 200),          # mg/dL
+        "bicarb_lab":    (3, 60),           # mmol/L
+        "sodium_lab":    (90, 200),         # mmol/L
+        "potassium_lab": (1.5, 8.0),        # mmol/L
+        "magnesium_lab": (0.5, 4.0),        # mg/dL
+        "calcium_lab":   (3, 20),           # mg/dL (total Ca)
+        "wbc_lab":       (0.1, 200),        # K/µL
+        "hemoglobin_lab":(1, 25),           # g/dL
+        "platelets_lab": (1, 1500),         # K/µL
+        "bilirubin_lab": (0, 35),           # mg/dL
+        "inr_lab":       (0.5, 15),         # No units
+        "pao2_lab":      (20, 600),         # mmHg
+
+        # Delta values
+        "delta_spo2":    (-50, 100),        # %
+        "delta_temp":    (-10, 10),         # °C
+        "delta_bun":     (-80, 200),
+        "delta_bicarb":  (-30, 30),
+        "delta_sodium":  (-40, 40),
+        "delta_potassium":(-4, 4),
+        "delta_magnesium":(-3, 3),
+        "delta_calcium": (-5, 5),
+        "delta_wbc":     (-50, 50),
+        "delta_hemoglobin": (-10, 10),
+        "delta_platelets": (-500, 500),
+        "delta_bilirubin": (-20, 20),
+        "delta_inr":     (-5, 5),
+        "delta_pao2":    (-300, 300),
+        "delta_hr":      (-100, 100),
+        "delta_rr":      (-40, 40),
+        "delta_map":     (-80, 80),
+        "delta_spo2":    (-50, 100),
+        "delta_fio2":    (-1.0, 1.0),
+        "delta_temp":    (-10, 10),
     }
 
+    # ----------------------------
+    # Cleaning loop
+    # ----------------------------
     for col, (lower, upper) in rules.items():
         if col not in df_clean.columns:
-            print(f"Column '{col}' not in dataframe, skipping.")
+            print(f"Column '{col}' not in dataframe — skipping.")
             continue
 
         before = df_clean[col].notna().sum()
 
-        # Replace out-of-range with NaN (do NOT drop rows)
         mask = (df_clean[col] < lower) | (df_clean[col] > upper)
         df_clean.loc[mask, col] = np.nan
 
         after = df_clean[col].notna().sum()
         removed = before - after
 
-        print(f"In {col}: Removed {removed} non-physiologic values "
-              f"({before} → {after})")
+        if removed > 0:
+            print(f"In {col}: Removed {removed} non-physiologic values "
+                  f"({before} → {after})")
+        else:
+            print(f"In {col}: No non-physiologic values removed.")
 
     return df_clean
 
@@ -606,7 +664,7 @@ def mice_impute_splits(
 #%%
 def train_logistic_regression(X_train, y_train):
     """
-    Train a Logistic Regression model assuming ALL categorical encoding
+    Train a Logistic Regression model assuming categorical encoding
     has already been performed upstream.
 
     Only numeric features are scaled via RobustScaler.
@@ -849,7 +907,7 @@ def tune_model(
     param_grid : dict or list of dicts
         Required for non-LR models.
     scoring : str
-        Metric for GridSearchCV (default: "f1").
+        Metric for RandomizedSearchCV (default: "f1").
     cv : int
         Number of folds for cross-validation.
     n_jobs : int
@@ -865,8 +923,6 @@ def tune_model(
     best_params : dict
     results_df : pd.DataFrame of all CV results
     """
-
-    from sklearn.model_selection import GridSearchCV
     from sklearn.linear_model import LogisticRegression
 
     # -------------------------------
@@ -882,29 +938,28 @@ def tune_model(
         print("Using built-in Logistic Regression hyperparameter search space.")
 
         param_grid = [
-            # L2 penalty
-            {
-                "penalty": ["l2"],
-                "C": [0.001, 0.01, 0.1, 1, 10],
-                "class_weight": [None, "balanced"],
-                "solver": ["lbfgs"],
-            },
-            # L1 penalty
-            {
-                "penalty": ["l1"],
-                "C": [0.001, 0.01, 0.1, 1, 10],
-                "class_weight": [None, "balanced"],
-                "solver": ["liblinear"],
-            },
-            # ElasticNet
-            {
-                "penalty": ["elasticnet"],
-                "l1_ratio": [0.0, 0.25, 0.5, 0.75, 1.0],
-                "C": [0.01, 0.1, 1, 10],
-                "class_weight": [None, "balanced"],
-                "solver": ["saga"],
-            }
-        ]
+        # L2 penalty — best for most clinical data
+        {
+            "penalty": ["l2"],
+            "C": [0.01, 0.1, 1, 10],
+            "solver": ["lbfgs"],
+        },
+
+        # L1 penalty — sparse model & FS
+        {
+            "penalty": ["l1"],
+            "C": [0.01, 0.1, 1],
+            "solver": ["liblinear"],   # liblinear is faster than saga here
+        },
+
+        # ElasticNet — only 2–3 key l1_ratios needed
+        {
+            "penalty": ["elasticnet"],
+            "C": [0.1, 1],
+            "l1_ratio": [0.25, 0.5, 0.75],
+            "solver": ["saga"],        # required for EN
+        }
+    ]
 
         # overwrite base_model with LR-specific defaults
         base_model = LogisticRegression(max_iter=5000, n_jobs=-1)
@@ -921,12 +976,14 @@ def tune_model(
     # -------------------------------
     # Grid Search
     # -------------------------------
-    grid = GridSearchCV(
+    grid = RandomizedSearchCV(
         estimator=base_model,
-        param_grid=param_grid,
+        param_distributions=param_grid,
         scoring=scoring,
         cv=cv,
         n_jobs=n_jobs,
+        n_iter=12,
+        random_state=42,
         verbose=verbose,
         return_train_score=True
     )
@@ -988,3 +1045,119 @@ def train_random_forest(
     model.fit(X_train, y_train)
 
     return model
+
+
+# ============================================================
+# Model tuning and hyperparameters
+# ============================================================
+
+def cross_val_evaluation(
+    model_class,
+    X,
+    y,
+    param_grid=None,
+    scoring="f1",
+    n_repeats=100,
+    n_folds=5,
+    random_state=42
+):
+    """
+    - Outer loop: repeated stratified splits (n_repeats)
+    - Inner loop: hyperparameter tuning inside each fold using tune_model()
+    
+    Returns:
+    ----------
+    results_df : pd.DataFrame
+        All metrics for all repeats × folds
+    best_model : estimator
+        Model that achieved the highest mean F1 across folds
+    best_params : dict
+        Hyperparameters associated with the best model
+    """
+
+    all_results = []
+    model_performance_tracking = []  # store (model, params, f1_mean)
+
+    for rep in range(n_repeats):
+        print(f"\n========================")
+        print(f"Repeat {rep+1}/{n_repeats}")
+        print("========================")
+
+        # Shuffle for each repeat
+        X_rep, y_rep = shuffle(X, y, random_state=random_state + rep)
+
+        skf = StratifiedKFold(
+            n_splits=n_folds,
+            shuffle=True,
+            random_state=random_state + rep
+        )
+
+        f1_scores_this_repeat = []
+        model_used_this_repeat = None
+        params_this_repeat = None
+
+        # ------------------------------
+        # Inner folds (true outer CV)
+        # ------------------------------
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X_rep, y_rep)):
+            print(f"\n--- Fold {fold+1}/{n_folds} ---")
+
+            X_train, X_val = X_rep.iloc[train_idx], X_rep.iloc[val_idx]
+            y_train, y_val = y_rep.iloc[train_idx], y_rep.iloc[val_idx]
+
+            # Hyperparameter tuning inside fold
+            best_model, best_params, _ = tune_model(
+                model_class=model_class,
+                X_train=X_train,
+                y_train=y_train,
+                param_grid=param_grid,
+                scoring=scoring,
+                cv=5,
+                n_jobs=-1,
+                verbose=0
+            )
+
+            # Evaluate performance of tuned model on val fold
+            precision, recall, f1, accuracy, th = evaluate_metrics_model(
+                best_model, X_val, y_val
+            )
+
+            f1_scores_this_repeat.append(f1)
+
+            # Track fold-level results
+            all_results.append({
+                "repeat": rep,
+                "fold": fold,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "accuracy": accuracy,
+                "threshold": th,
+                "best_params": best_params
+            })
+
+            # Save last model in this repeat (all have same hyperparams)
+            model_used_this_repeat = best_model
+            params_this_repeat = best_params
+
+        # Store model performance for this repeat
+        mean_f1 = np.mean(f1_scores_this_repeat)
+        model_performance_tracking.append(
+            (mean_f1, model_used_this_repeat, params_this_repeat)
+        )
+
+    # ------------------------------------------------------------------------------
+    # Select BEST model across all repeats based on mean F1
+    # ------------------------------------------------------------------------------
+    model_performance_tracking.sort(key=lambda x: x[0], reverse=True)
+    best_mean_f1, best_model, best_params = model_performance_tracking[0]
+
+    print("\n==============================")
+    print(" BEST MODEL ACROSS ALL REPEATS")
+    print("==============================")
+    print(f"Mean F1 across folds = {best_mean_f1:.4f}")
+    print("Best hyperparameters:", best_params)
+
+    results_df = pd.DataFrame(all_results)
+
+    return results_df, best_model, best_params

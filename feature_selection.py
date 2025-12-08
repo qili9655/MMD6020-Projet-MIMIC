@@ -382,237 +382,126 @@ def perform_regularized_logistic_selection(
 # 4. Orchestrator: compare FS methods + models (Leaderboard)
 # ============================================================
 
-def train_model_for_features(
-    model_name: str,
+from sklearn.base import clone
+
+def run_feature_selection(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_val: pd.DataFrame,
     y_val: pd.Series,
-) -> Tuple[float, Any]:
-    """
-    Helper: trains a given model on (X_train, y_train), evaluates AUC on val.
-
-    model_name ∈ {"logistic", "rf", "mlp"}
-    Returns (auc_val, fitted_model)
-    """
-    if model_name == "logistic":
-        est = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "clf",
-                    LogisticRegression(
-                        penalty="l2",
-                        solver="liblinear",
-                        max_iter=2000,
-                        random_state=42,
-                    ),
-                ),
-            ]
-        )
-    elif model_name == "rf":
-        est = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=None,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        )
-    elif model_name == "mlp":
-        est = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                (
-                    "clf",
-                    MLPClassifier(
-                        hidden_layer_sizes=(32, 16),
-                        activation="relu",
-                        solver="adam",
-                        max_iter=500,
-                        random_state=42,
-                    ),
-                ),
-            ]
-        )
-    else:
-        raise ValueError(f"Unknown model_name: {model_name}")
-
-    est.fit(X_train, y_train)
-    y_val_proba = est.predict_proba(X_val)[:, 1]
-    auc_val = roc_auc_score(y_val, y_val_proba)
-
-    return auc_val, est
-
-
-def run_feature_selection_leaderboard(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
+    tuned_model,
     n_features: int = 10,
     output_dir: Optional[str] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+):
     """
-    Run multiple feature selection methods, evaluate different models,
-    build a leaderboard, and optionally export plots & tables.
+    Perform feature selection using multiple FS methods,
+    retrain *one tuned model* on the top-n features,
+    compare full-model vs reduced-model AUC,
+    and return the small-model for further evaluation.
 
-    Methods:
-      - Mutual Information
-      - Chi-Squared
-      - Sequential Feature Selection (SFS) with Logistic Regression
-      - Regularized Logistic Regression (L1/L2/EN)
-
-    Models:
-      - Logistic Regression
-      - Random Forest
-      - MLP (Neural Network)
+    Parameters
+    ----------
+    tuned_model : fitted sklearn model
+        A previously tuned model (LR or RF).
 
     Returns
     -------
-    leaderboard : DataFrame
-        One row per (FS method, model, feature subset)
-    details : dict
-        Nested results by method.
+    leaderboard : pd.DataFrame
+    methods_results : dict
+        Contains selected features per FS method.
+    best_small_model : sklearn estimator
+        Best reduced-feature model (retrained tuned model).
     """
+
+    from sklearn.base import clone
+    from sklearn.metrics import roc_auc_score
+    from pathlib import Path
 
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods_results: Dict[str, Dict[str, Any]] = {}
-    leaderboard_records: List[Dict[str, Any]] = []
+    methods_results = {}
+    leaderboard_records = []
 
-    # -------------------------
-    # 1. Statistical — MI
-    # -------------------------
-    mi_feats, fig_mi = perform_statistical_feature_selection(
-        X_train, y_train,
-        n_features_to_select=n_features,
-        method="mutual_info",
-        output_path=str(output_dir / "fs_mutual_info.png") if output_dir else None,
+    # ============================================================
+    # 1. Feature Selection Methods
+    # ============================================================
+
+    # --- Mutual Information ---
+    mi_feats, _ = perform_statistical_feature_selection(
+        X_train, y_train, n_features_to_select=n_features, method="mutual_info"
     )
-    methods_results["Mutual Information"] = {
-        "features": mi_feats,
-        "fig": fig_mi,
-    }
+    methods_results["Mutual Information"] = {"features": mi_feats}
 
-    # -------------------------
-    # 2. Statistical — Chi²
-    # -------------------------
-    chi2_feats, fig_chi2 = perform_statistical_feature_selection(
-        X_train, y_train,
-        n_features_to_select=n_features,
-        method="chi2",
-        output_path=str(output_dir / "fs_chi2.png") if output_dir else None,
+    # --- Chi-Square ---
+    chi2_feats, _ = perform_statistical_feature_selection(
+        X_train, y_train, n_features_to_select=n_features, method="chi2"
     )
-    methods_results["Chi2"] = {
-        "features": chi2_feats,
-        "fig": fig_chi2,
-    }
+    methods_results["Chi2"] = {"features": chi2_feats}
 
-    # -------------------------
-    # 3. Sequential FS (SFS) with Logistic
-    # -------------------------
-    sfs_feats, fig_sfs = perform_sequential_feature_selection(
-        model_class=LogisticRegression,
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        n_features_to_select=n_features,
-        direction="forward",
-        cv=3,
-        scale=True,
-        max_iter=2000,
-        solver="liblinear",
-        random_state=42,
-    )
-    methods_results["SFS Logistic"] = {
-        "features": sfs_feats,
-        "fig": fig_sfs,
-    }
+    # --- Sequential Forward Selection (Logistic Regression) ---
+    try:
+        sfs_feats, _ = perform_sequential_feature_selection(
+            model_class=tuned_model.__class__,
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            n_features_to_select=n_features,
+            direction="forward",
+            cv=3,
+            scale=True,
+            random_state=42,
+        )
+        methods_results["SFS"] = {"features": sfs_feats}
+    except Exception as e:
+        print(f"[Warning] SFS failed for {tuned_model.__class__.__name__}: {e}")
 
-    # -------------------------
-    # 4. Logistic Regularization (L1/L2/EN)
-    # -------------------------
-    reg_feats, best_logreg, fig_reg = perform_regularized_logistic_selection(
-        X_train, y_train,
-        X_val, y_val,
-        penalties=["l1", "l2", "elasticnet"],
-        Cs=None,
-        l1_ratios=None,
-        max_iter=2000,
-        random_state=42,
-    )
-    methods_results["LR Regularization"] = {
-        "features": reg_feats,
-        "clf": best_logreg,
-        "fig": fig_reg,
-    }
+    # --- LR Regularization FS (only for LR; skip for RF) ---
+    if hasattr(tuned_model, "coef_") or isinstance(tuned_model, LogisticRegression):
+        try:
+            reg_feats, _, _ = perform_regularized_logistic_selection(
+                X_train, y_train, X_val, y_val, max_iter=2000, random_state=42
+            )
+            methods_results["LR Regularization"] = {"features": reg_feats}
+        except Exception as e:
+            print(f"[Warning] Regularization FS skipped: {e}")
 
-    # ======================================================
-    # Evaluate each FS method with 3 models and build table
-    # ======================================================
+    # ============================================================
+    # 2. Evaluate full-feature model
+    # ============================================================
+    auc_full = roc_auc_score(y_val, tuned_model.predict_proba(X_val)[:, 1])
 
-    model_names = ["logistic", "rf", "mlp"]
+    # ============================================================
+    # 3. Retrain tuned model on reduced features
+    # ============================================================
 
     for method_name, info in methods_results.items():
         feats = info["features"]
-        Xtr = X_train[feats]
-        Xv = X_val[feats]
+        Xtr_small = X_train[feats]
+        Xv_small = X_val[feats]
 
-        for mname in model_names:
-            auc_val, est = train_model_for_features(
-                mname, Xtr, y_train, Xv, y_val
-            )
-            leaderboard_records.append(
-                {
-                    "fs_method": method_name,
-                    "model": mname,
-                    "n_features": len(feats),
-                    "features": feats,
-                    "val_auc": auc_val,
-                }
-            )
-            # store estimator as well
-            info.setdefault("models", {})[mname] = {
-                "estimator": est,
-                "val_auc": auc_val,
-            }
+        small_model = clone(tuned_model)
+        small_model.fit(Xtr_small, y_train)
+        auc_small = roc_auc_score(y_val, small_model.predict_proba(Xv_small)[:, 1])
+
+        leaderboard_records.append({
+            "fs_method": method_name,
+            "n_features": len(feats),
+            "features": feats,
+            "auc_full": auc_full,
+            "auc_small": auc_small,
+            "delta_auc": auc_small - auc_full,
+            "small_model": small_model,
+        })
 
     leaderboard = pd.DataFrame(leaderboard_records)
-    leaderboard = leaderboard.sort_values("val_auc", ascending=False).reset_index(drop=True)
+    leaderboard = leaderboard.sort_values("auc_small", ascending=False).reset_index(drop=True)
 
-    print("\n" + "=" * 80)
-    print("FEATURE SELECTION + MODEL LEADERBOARD (sorted by validation AUC)")
-    print("=" * 80)
-    print(leaderboard[["fs_method", "model", "n_features", "val_auc"]])
+    best_small_model = leaderboard.iloc[0]["small_model"]
 
     if output_dir:
-        leaderboard.to_csv(output_dir / "feature_selection_LR.csv", index=False)
+        leaderboard.to_csv(output_dir / "feature_selection_comparison.csv", index=False)
 
-    # Quick barplot of top configurations
-    fig_lb, ax = plt.subplots(figsize=(10, 6))
-    top_k = min(20, len(leaderboard))
-    sns.barplot(
-        data=leaderboard.head(top_k),
-        x="val_auc",
-        y="fs_method",
-        hue="model",
-        ax=ax,
-        orient="h",
-    )
-    ax.set_xlabel("Validation AUC")
-    ax.set_ylabel("Feature Selection Method")
-    ax.set_title("Top configurations by AUC")
-    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
-    plt.tight_layout()
-
-    if output_dir:
-        fig_lb.savefig(output_dir / "LR_barplot.png", dpi=150, bbox_inches="tight")
-
-    methods_results["LR_leaderboard_fig"] = fig_lb
-
-    return leaderboard, methods_results
-
+    return leaderboard, methods_results, best_small_model
