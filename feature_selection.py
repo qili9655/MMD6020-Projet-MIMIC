@@ -415,7 +415,6 @@ def run_feature_selection(
 
     from sklearn.base import clone
     from sklearn.metrics import roc_auc_score
-    from pathlib import Path
 
     if output_dir is not None:
         output_dir = Path(output_dir)
